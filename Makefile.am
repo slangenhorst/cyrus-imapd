@@ -1799,6 +1799,10 @@ ptclient_ptloader_LDADD += $(AFS_LIBS)
 ptclient_ptloader_LDFLAGS += $(AFS_LDFLAGS)
 endif
 
+if USE_HTTPPTS
+ptclient_ptloader_SOURCES += ptclient/http.c
+endif
+
 # Each new version of flex seems to generate new sign-comparison
 # warnings, while they switch code around between int/yy_size_t.
 #
