@@ -523,6 +523,7 @@ EXPORTED int quota_update_useds(const char *quotaroot,
     quota_init(&q, quotaroot);
 
     r = quota_read(&q, &tid, 1);
+    if (r) syslog(LOG_ERR, "QUOTAERROR: failed to read quota for %s (%s)", mboxname, error_message(r));
 
     if (!r) {
         int res;
@@ -544,6 +545,7 @@ EXPORTED int quota_update_useds(const char *quotaroot,
             }
         }
         r = quota_write(&q, silent, &tid);
+        if (r) syslog(LOG_ERR, "QUOTAERROR: failed to write quota for %s (%s)", mboxname, error_message(r));
     }
 
     if (r) {
