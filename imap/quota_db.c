@@ -426,6 +426,7 @@ EXPORTED void quota_commit(struct txn **tid)
 EXPORTED void quota_abort(struct txn **tid)
 {
     if (tid && *tid) {
+        syslog(LOG_NOTICE, "QUOTADEBUG: quota abort called with txn");
         if (cyrusdb_abort(qdb, *tid)) {
             syslog(LOG_ERR, "IOERROR: aborting quota: %m");
         }
@@ -478,6 +479,8 @@ EXPORTED int quota_write(struct quota *quota, int silent, struct txn **tid)
     dlist_setnum64(dl, "MODSEQ", quota->modseq);
 
     dlist_printbuf(dl, 0, &buf);
+
+    syslog(LOG_NOTICE, "QUOTADEBUG: quota write root=<%s> data=<%.*s>", quota->root, (int)buf.len, buf.s);
 
     r = cyrusdb_store(qdb, quota->root, qrlen, buf.s, buf.len, tid);
 
@@ -618,6 +621,8 @@ EXPORTED int quota_deleteroot(const char *quotaroot, int silent)
         return IMAP_QUOTAROOT_NONEXISTENT;
 
     r = cyrusdb_delete(qdb, quotaroot, strlen(quotaroot), NULL, 0);
+
+    syslog(LOG_NOTICE, "QUOTADEBUG: removed quota root=<%s>", quotaroot);
 
     switch (r) {
     case CYRUSDB_OK:
