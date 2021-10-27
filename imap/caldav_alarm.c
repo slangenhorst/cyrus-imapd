@@ -1013,7 +1013,11 @@ static int process_futurerelease(struct mailbox *mailbox,
         syslog(LOG_ERR, "smtpclient_open failed: %s", error_message(r));
         goto done;
     }
-    smtpclient_set_auth(sm, json_string_value(identity));
+    char *authid = mboxname_to_userid(mailbox_name(mailbox));
+    smtpclient_set_auth(sm, authid);
+    free(authid);
+
+    smtpclient_set_jmapid(sm, json_string_value(identity));
 
     /* Prepare envelope */
     smtp_envelope_t smtpenv = SMTP_ENVELOPE_INITIALIZER;
