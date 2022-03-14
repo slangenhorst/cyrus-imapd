@@ -122,29 +122,45 @@ EXPORTED int caldav_alarm_done(void)
     " mboxname TEXT NOT NULL,"                          \
     " imap_uid INTEGER NOT NULL,"                       \
     " nextcheck INTEGER NOT NULL,"                      \
+    " type INTEGER NOT NULL,"                           \
+    " numrcpts INTEGER NOT NULL,"                       \
     " PRIMARY KEY (mboxname, imap_uid)"                 \
     ");"                                                \
-    "CREATE INDEX IF NOT EXISTS checktime ON events (nextcheck);"
+    "CREATE INDEX IF NOT EXISTS checktime ON events (nextcheck);" \
+    "CREATE INDEX IF NOT EXISTS idx_type ON events (type);"
 
 
-#define DBVERSION 2
+#define DBVERSION 3
 
 /* the command loop will do the upgrade and then drop the old tables.
  * Sadly there's no other way to do it without creating a lock inversion! */
 #define CMD_UPGRADEv2 CMD_CREATE
 
+#define CMD_UPGRADEv3                                   \
+    "ALTER TABLE events ADD COLUMN type INTEGER;"       \
+    "ALTER TABLE events ADD COLUMN numrcpts INTEGER;"   \
+    "UPDATE events SET type = 1, numrcpts = 0;"         \
+    "CREATE INDEX IF NOT EXISTS idx_type ON events (type);"
+
 static struct sqldb_upgrade upgrade[] = {
-    { 2, CMD_UPGRADEv2, NULL },
+    /* Don't upgrade to version 2. */
+    { 3, CMD_UPGRADEv3, NULL },
     /* always finish with an empty row */
     { 0, NULL, NULL }
 };
 
-#define CMD_REPLACE                              \
-    "REPLACE INTO events"                        \
-    " ( mboxname, imap_uid, nextcheck )"         \
-    " VALUES"                                    \
-    " ( :mboxname, :imap_uid, :nextcheck )"      \
+#define CMD_REPLACE                                            \
+    "REPLACE INTO events"                                      \
+    " ( mboxname, imap_uid, nextcheck, type, numrcpts )"       \
+    " VALUES"                                                  \
+    " ( :mboxname, :imap_uid, :nextcheck, :type, :numrcpts )"  \
     ";"
+
+#define CMD_UPDATE                               \
+    "UPDATE events SET"                          \
+    "  nextcheck = :nextcheck"                   \
+    " WHERE mboxname = :mboxname"                \
+    "   AND imap_uid = :imap_uid"
 
 #define CMD_DELETE                               \
     "DELETE FROM events"                         \
@@ -162,10 +178,10 @@ static struct sqldb_upgrade upgrade[] = {
     " mboxname LIKE :prefix"     \
     ";"
 
-#define CMD_SELECTUSER           \
-    "SELECT mboxname, imap_uid, nextcheck" \
-    " FROM events WHERE"                   \
-    " mboxname LIKE :prefix"               \
+#define CMD_SELECTUSER                                      \
+    "SELECT mboxname, imap_uid, nextcheck, type, numrcpts"  \
+    " FROM events WHERE"                                    \
+    " mboxname LIKE :prefix"                                \
     ";"
 
 #define CMD_SELECT_ALARMS                                                \
@@ -248,6 +264,8 @@ static int copydb(sqlite3_stmt *stmt, void *rock)
         { ":mboxname",  SQLITE_TEXT,    { .s = (const char *)sqlite3_column_text(stmt, 0) } },
         { ":imap_uid",  SQLITE_INTEGER, { .i = sqlite3_column_int(stmt, 1)  } },
         { ":nextcheck", SQLITE_INTEGER, { .i = sqlite3_column_int(stmt, 2)  } },
+        { ":type",      SQLITE_INTEGER, { .i = sqlite3_column_int(stmt, 3)  } },
+        { ":numrcpts",  SQLITE_INTEGER, { .i = sqlite3_column_int(stmt, 4)  } },
         { NULL,         SQLITE_NULL,    { .s = NULL      } }
     };
     return sqldb_exec(destdb, CMD_REPLACE, bval, NULL, NULL);
@@ -571,12 +589,15 @@ static int process_alarm_cb(icalcomponent *comp,
 }
 
 static int update_alarmdb(const char *mboxname,
-                          uint32_t imap_uid, time_t nextcheck)
+                          uint32_t imap_uid, time_t nextcheck,
+                          uint32_t type, uint32_t numrcpts)
 {
     struct sqldb_bindval bval[] = {
         { ":mboxname",  SQLITE_TEXT,    { .s = mboxname  } },
         { ":imap_uid",  SQLITE_INTEGER, { .i = imap_uid  } },
         { ":nextcheck", SQLITE_INTEGER, { .i = nextcheck } },
+        { ":type",      SQLITE_INTEGER, { .i = type      } },
+        { ":numrcpts",  SQLITE_INTEGER, { .i = numrcpts  } },
         { NULL,         SQLITE_NULL,    { .s = NULL      } }
     };
 
@@ -584,13 +605,15 @@ static int update_alarmdb(const char *mboxname,
     if (!alarmdb) return -1;
     int rc = SQLITE_OK;
 
-    syslog(LOG_DEBUG, "update_alarmdb(%s:%u, " TIME_T_FMT ")",
-           mboxname, imap_uid, nextcheck);
+    syslog(LOG_DEBUG, "update_alarmdb(%s:%u, " TIME_T_FMT ", %u, %u)",
+           mboxname, imap_uid, nextcheck, type, numrcpts);
 
-    if (nextcheck)
+    if (!nextcheck)
+        rc = sqldb_exec(alarmdb, CMD_DELETE, bval, NULL, NULL);
+    else if (type)
         rc = sqldb_exec(alarmdb, CMD_REPLACE, bval, NULL, NULL);
     else
-        rc = sqldb_exec(alarmdb, CMD_DELETE, bval, NULL, NULL);
+        rc = sqldb_exec(alarmdb, CMD_UPDATE, bval, NULL, NULL);
 
     caldav_alarm_close(alarmdb);
 
@@ -708,15 +731,27 @@ done:
     return 0;
 }
 
-static int has_alarms(icalcomponent *ical, struct mailbox *mailbox, uint32_t uid)
+static int has_alarms(void *data, struct mailbox *mailbox,
+                      uint32_t uid, unsigned *numrcpts)
 {
     int has_alarms = 0;
 
     syslog(LOG_DEBUG, "checking for alarms in mailbox %s uid %u",
            mailbox_name(mailbox), uid);
 
-    if (mailbox->i.options & OPT_IMAP_HAS_ALARMS) return 1;
+    if (mailbox->i.options & OPT_IMAP_HAS_ALARMS) {
+        if (data && numrcpts &&
+            mbtype_isa(mailbox_mbtype(mailbox)) == MBTYPE_JMAPSUBMIT) {
+            json_t *submission = (json_t *) data;
+            json_t *envelope = json_object_get(submission, "envelope");
+            if (envelope) {
+                *numrcpts = json_array_size(json_object_get(envelope, "rcptTo"));
+            }
+        }
+        return 1;
+    }
 
+    icalcomponent *ical = (icalcomponent *) data;
     if (ical) {
         /* Check iCalendar resource for VALARMs */
         icalcomponent *comp = icalcomponent_get_first_real_component(ical);
@@ -870,13 +905,39 @@ static int read_lastalarm(struct mailbox *mailbox,
     return r;
 }
 
+static enum alarm_type mbtype_to_alarm_type(uint32_t mbtype)
+{
+    enum alarm_type atype = 0;
+
+    switch (mbtype_isa(mbtype)) {
+    case MBTYPE_CALENDAR:
+        atype = ALARM_CALENDAR;
+        break;
+    case MBTYPE_EMAIL:
+        atype = ALARM_SNOOZE;
+        break;
+    case MBTYPE_JMAPSUBMIT:
+        atype = ALARM_SEND;
+        break;
+    default:
+        assert(0);
+    }
+
+    return atype;
+}
+
 /* add a calendar alarm */
 HIDDEN int caldav_alarm_add_record(struct mailbox *mailbox,
-                                     const struct index_record *record,
-                                     icalcomponent *ical)
+                                   const struct index_record *record,
+                                   void *data)
 {
-    if (has_alarms(ical, mailbox, record->uid))
-        update_alarmdb(mailbox_name(mailbox), record->uid, record->internaldate);
+    unsigned numrcpts = 0;
+
+    if (has_alarms(data, mailbox, record->uid, &numrcpts)) {
+        enum alarm_type atype = mbtype_to_alarm_type(mailbox_mbtype(mailbox));
+        update_alarmdb(mailbox_name(mailbox), record->uid, record->internaldate,
+                       atype, numrcpts);
+    }
 
     return 0;
 }
@@ -885,10 +946,15 @@ EXPORTED int caldav_alarm_touch_record(struct mailbox *mailbox,
                                        const struct index_record *record,
                                        int force)
 {
+    unsigned numrcpts = 0;
+
     /* if there are alarms in the annotations,
      * the next alarm may have become earlier, so get calalarmd to check again */
-    if (force || has_alarms(NULL, mailbox, record->uid))
-        return update_alarmdb(mailbox_name(mailbox), record->uid, record->last_updated);
+    if (force || has_alarms(NULL, mailbox, record->uid, &numrcpts)) {
+        enum alarm_type atype = mbtype_to_alarm_type(mailbox_mbtype(mailbox));
+        return update_alarmdb(mailbox_name(mailbox), record->uid,
+                              record->last_updated, atype, numrcpts);
+    }
 
     return 0;
 }
@@ -899,8 +965,11 @@ EXPORTED int caldav_alarm_touch_record(struct mailbox *mailbox,
 EXPORTED int caldav_alarm_sync_nextcheck(struct mailbox *mailbox, const struct index_record *record)
 {
     struct lastalarm_data data;
-    if (!read_lastalarm(mailbox, record, &data))
-        return update_alarmdb(mailbox_name(mailbox), record->uid, data.nextcheck);
+    if (!read_lastalarm(mailbox, record, &data)) {
+        enum alarm_type atype = mbtype_to_alarm_type(mailbox_mbtype(mailbox));
+        return update_alarmdb(mailbox_name(mailbox), record->uid,
+                              data.nextcheck, atype, 0);
+    }
 
     /* if there's no lastalarm on the record, nuke any existing alarmdb entry */
     return caldav_alarm_delete_record(mailbox_name(mailbox), record->uid);
@@ -909,7 +978,13 @@ EXPORTED int caldav_alarm_sync_nextcheck(struct mailbox *mailbox, const struct i
 /* delete all alarms matching the event */
 HIDDEN int caldav_alarm_delete_record(const char *mboxname, uint32_t imap_uid)
 {
-    return update_alarmdb(mboxname, imap_uid, 0);
+    return update_alarmdb(mboxname, imap_uid, 0, 0, 0);
+}
+
+static int caldav_alarm_bump_nextcheck(const char *mboxname,
+                                       uint32_t imap_uid, time_t nextcheck)
+{
+    return update_alarmdb(mboxname, imap_uid, nextcheck, 0, 0);
 }
 
 /* delete all alarms matching the event */
@@ -1064,7 +1139,7 @@ static int process_valarms(struct mailbox *mailbox,
 
     /* check for bogus lastalarm data on record
        which actually shouldn't have it */
-    if (!has_alarms(ical, mailbox, record->uid)) {
+    if (!has_alarms(ical, mailbox, record->uid, NULL)) {
         syslog(LOG_NOTICE, "removing bogus lastalarm check "
                "for mailbox %s uid %u which has no alarms",
                mboxname, record->uid);
@@ -1123,7 +1198,7 @@ static int process_valarms(struct mailbox *mailbox,
     data.lastrun = runtime;
     if (!dryrun) write_lastalarm(mailbox, record, &data);
 
-    update_alarmdb(mboxname, record->uid, data.nextcheck);
+    update_alarmdb(mboxname, record->uid, data.nextcheck, ALARM_CALENDAR, 0);
 
 done_item:
     if (ical) icalcomponent_free(ical);
@@ -1499,7 +1574,7 @@ static int process_snoozed(struct mailbox *mailbox,
     snoozed = jmap_fetch_snoozed(mailbox_name(mailbox), record->uid);
     if (!snoozed) {
         // no worries, let's not try again
-        update_alarmdb(mailbox_name(mailbox), record->uid, 0);
+        caldav_alarm_delete_record(mailbox_name(mailbox), record->uid);
         goto done;
     }
 
@@ -1509,7 +1584,7 @@ static int process_snoozed(struct mailbox *mailbox,
 
     /* Check runtime against wakeup and adjust as necessary */
     if (dryrun || wakeup > runtime) {
-        update_alarmdb(mailbox_name(mailbox), record->uid, wakeup);
+        caldav_alarm_bump_nextcheck(mailbox_name(mailbox), record->uid, wakeup);
         goto done;
     }
 
@@ -1523,7 +1598,7 @@ static int process_snoozed(struct mailbox *mailbox,
         syslog(LOG_ERR, "IOERROR: failed to unsnooze %s:%u (%s)",
                mailbox_name(mailbox), record->uid, error_message(r));
         /* try again in 5 minutes */
-        update_alarmdb(mailbox_name(mailbox), record->uid, runtime + 300);
+        caldav_alarm_bump_nextcheck(mailbox_name(mailbox), record->uid, runtime + 300);
     }
 
  done:
@@ -1552,7 +1627,7 @@ static void process_one_record(struct caldav_alarm_data *data, time_t runtime, i
         /* Temporary error - skip over this message for now and try again in 5 minutes */
         syslog(LOG_ERR, "IOERROR: failed to open mailbox %s for uid %u (%s)",
                data->mboxname, data->imap_uid, error_message(r));
-        update_alarmdb(data->mboxname, data->imap_uid, runtime + 300);
+        caldav_alarm_bump_nextcheck(mailbox_name(mailbox), data->imap_uid, runtime + 300);
         return;
     }
 
@@ -1570,7 +1645,7 @@ static void process_one_record(struct caldav_alarm_data *data, time_t runtime, i
         syslog(LOG_ERR, "IOERROR: error reading mailbox %s uid %u (%s)",
                data->mboxname, data->imap_uid, error_message(r));
         /* XXX no index record? item deleted or transient error? */
-        update_alarmdb(data->mboxname, data->imap_uid, runtime + 300);
+        caldav_alarm_bump_nextcheck(mailbox_name(mailbox), data->imap_uid, runtime + 300);
         goto done;
     }
 
@@ -1590,7 +1665,7 @@ static void process_one_record(struct caldav_alarm_data *data, time_t runtime, i
 #ifdef WITH_JMAP
     else if (mbtype_isa(mailbox_mbtype(mailbox)) == MBTYPE_JMAPSUBMIT) {
         if (record.internaldate > runtime || dryrun) {
-            update_alarmdb(data->mboxname, data->imap_uid, record.internaldate);
+            caldav_alarm_bump_nextcheck(data->mboxname, data->imap_uid, record.internaldate);
             goto done;
         }
         r = process_futurerelease(mailbox, &record);
@@ -1768,14 +1843,15 @@ EXPORTED int caldav_alarm_upgrade()
             icalcomponent *ical = record_to_ical(mailbox, record, NULL);
 
             if (ical) {
-                if (has_alarms(ical, mailbox, record->uid)) {
+                if (has_alarms(ical, mailbox, record->uid, NULL)) {
                     char *userid = mboxname_to_userid(mailbox_name(mailbox));
                     time_t nextcheck = process_alarms(mailbox_name(mailbox), record->uid,
                                                       userid, floatingtz, ical,
                                                       runtime, runtime, /*dryrun*/1);
                     free(userid);
 
-                    update_alarmdb(mailbox_name(mailbox), record->uid, nextcheck);
+                    update_alarmdb(mailbox_name(mailbox), record->uid, nextcheck,
+                                   ALARM_CALENDAR, 0);
                 }
                 icalcomponent_free(ical);
             }
